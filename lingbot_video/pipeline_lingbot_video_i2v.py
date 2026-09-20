@@ -15,7 +15,6 @@ from .pipeline_lingbot_video import (
     LingBotVideoPipeline,
     LingBotVideoPipelineOutput,
     _group_global_rank,
-    _module_device,
     _module_dtype,
     _transformer_autocast,
     _transformer_timestep,
@@ -123,11 +122,11 @@ class LingBotVideoImageToVideoPipeline(LingBotVideoPipeline):
     ) -> torch.Tensor:
         if self.vae is None:
             raise ValueError("`vae` is required to encode image latents.")
-        device = _module_device(self.vae)
-        pixel = pixel.to(device=device, dtype=torch.float32)
-        norm_pixel = (pixel - 0.5) / 0.5
-        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
-            latents = self.vae.encode(norm_pixel).latent_dist.sample(generator)
+        with self._vae_encode_context() as device:
+            pixel = pixel.to(device=device, dtype=torch.float32)
+            norm_pixel = (pixel - 0.5) / 0.5
+            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
+                latents = self.vae.encode(norm_pixel).latent_dist.sample(generator)
 
         mean = torch.tensor(self.vae.config.latents_mean, device=latents.device, dtype=torch.float32)
         std_inv = 1.0 / torch.tensor(

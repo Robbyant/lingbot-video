@@ -311,6 +311,26 @@ def _default_device() -> torch.device:
     return torch.device("cuda", torch.cuda.current_device())
 
 
+def _validate_cpu_offload_args(args: argparse.Namespace) -> None:
+    if args.cpu_offload == "none":
+        return
+    _, _, world_size = _distributed_env()
+    if args.engine != "diffusers":
+        raise ValueError("--cpu_offload supports the diffusers engine only.")
+    if not torch.cuda.is_available():
+        raise RuntimeError("--cpu_offload requires CUDA.")
+    if (
+        world_size != 1
+        or args.enable_fsdp_inference
+        or args.enable_vlm_fsdp_inference
+        or args.cfg_parallel_degree > 1
+        or args.context_parallel_degree > 1
+    ):
+        raise ValueError(
+            "--cpu_offload requires single-process inference without FSDP, CFG, or CP."
+        )
+
+
 def _init_parallel(
     cfg_degree: int,
     context_degree: int,
@@ -647,6 +667,9 @@ def _log_progress(message: str) -> None:
 
 def _release_pipeline_for_memory(pipe: Any, label: str) -> None:
     inner_pipe = _inner_diffusers_pipe(pipe)
+    remove_all_hooks = getattr(inner_pipe, "remove_all_hooks", None)
+    if callable(remove_all_hooks):
+        remove_all_hooks()
     for name in ("transformer", "text_encoder", "vae"):
         if hasattr(inner_pipe, name):
             setattr(inner_pipe, name, None)
@@ -869,7 +892,15 @@ def _load_diffusers_pipe(
     transformer_subfolder: str,
     deferred_components: frozenset[str] = frozenset(),
     shared_components: dict[str, Any] | None = None,
+    cpu_offload: str = "none",
 ) -> Any:
+    if cpu_offload not in {"none", "model", "sequential"}:
+        raise ValueError(f"unsupported CPU offload mode: {cpu_offload}")
+    if cpu_offload != "none" and deferred_components:
+        raise ValueError("--cpu_offload cannot be combined with deferred component placement.")
+    if cpu_offload != "none" and shared_components:
+        raise ValueError("--cpu_offload cannot be combined with shared pipeline modules.")
+
     pipeline_class = _pipeline_class_for_mode(mode)
     transformer = _load_transformer_component(model_dir, transformer_subfolder, dtype_map)
 
@@ -885,6 +916,13 @@ def _load_diffusers_pipe(
         )
     _log_progress(f"loaded pipeline mode={mode}")
     device = _default_device()
+    if cpu_offload != "none":
+        _log_progress(f"enabling {cpu_offload} CPU offload to {device}")
+        if cpu_offload == "model":
+            pipe.enable_model_cpu_offload(device=device)
+        else:
+            pipe.enable_sequential_cpu_offload(device=device)
+        return pipe
     if deferred_components:
         return _move_pipeline_modules_to_device(pipe, device, deferred_components)
     _log_progress(f"moving pipeline to {device}")
@@ -940,6 +978,7 @@ def _load_pipe(
             transformer_subfolder=args.transformer_subfolder,
             deferred_components=deferred_components,
             shared_components=shared_components,
+            cpu_offload=args.cpu_offload,
         )
         engine_name = "diffusers-reference"
     elif args.engine == "sglang-native":
@@ -1044,13 +1083,15 @@ def _maybe_preload_refiner(
     refiner_args.mode = "t2v"
     refiner_dtype_map = dict(dtype_map)
     refiner_dtype_map["vae"] = _parse_dtype(args.refiner_vae_dtype)
-    shared_components = _shared_auxiliary_components(
-        base_pipe,
-        Path(args.model_dir),
-        Path(refiner_args.model_dir),
-        dtype_map,
-        refiner_dtype_map,
-    )
+    shared_components = {}
+    if args.cpu_offload == "none":
+        shared_components = _shared_auxiliary_components(
+            base_pipe,
+            Path(args.model_dir),
+            Path(refiner_args.model_dir),
+            dtype_map,
+            refiner_dtype_map,
+        )
     if shared_components:
         _log_progress(
             "reusing Base auxiliary components for Refiner: "
@@ -1270,6 +1311,12 @@ def main() -> None:
         default=_env_flag("LINGBOT_DETERMINISTIC_ALGORITHMS"),
     )
     parser.add_argument(
+        "--cpu_offload",
+        choices=["none", "model", "sequential"],
+        default="none",
+        help="Offload Diffusers pipeline modules to CPU with Accelerate.",
+    )
+    parser.add_argument(
         "--quiet_progress",
         action="store_true",
         help="Disable model-loading logs and denoising progress bars.",
@@ -1348,6 +1395,7 @@ def main() -> None:
         backend=args.backend,
         stderr=sys.stderr,
     )
+    _validate_cpu_offload_args(args)
     args.negative_prompt = resolve_negative_prompt_arg(
         args.negative_prompt,
         args.negative_prompt_json,
@@ -1580,6 +1628,7 @@ def main() -> None:
             f"attn_backend={os.environ.get('DIFFUSERS_ATTN_BACKEND')} "
             f"allow_tf32={torch.backends.cuda.matmul.allow_tf32} "
             f"deterministic_algorithms={torch.are_deterministic_algorithms_enabled()} "
+            f"cpu_offload={args.cpu_offload} "
             f"vae_tiling={args.vae_tiling} "
             f"release_base_before_refiner={args.release_base_before_refiner} "
             f"dit_fsdp_inference={base_fsdp_info} "
@@ -1699,6 +1748,7 @@ def main() -> None:
             f"t_thresh={args.refiner_t_thresh} tail_steps={args.refiner_sigma_tail_steps} "
             f"seed={args.seed} "
             f"batch_cfg={args.refiner_batch_cfg} "
+            f"cpu_offload={args.cpu_offload} "
             f"first_frame_condition={first_frame_condition_enabled} "
             f"vae_tiling={args.refiner_vae_tiling} "
             f"dit_fsdp_inference={refiner_fsdp_info} "

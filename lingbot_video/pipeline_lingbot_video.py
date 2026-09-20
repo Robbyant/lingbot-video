@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -156,6 +156,29 @@ class LingBotVideoPipeline(DiffusionPipeline):
         self.img_prompt_template = IMG_PROMPT_TEMPLATE
         self.video_prompt_template = VIDEO_PROMPT_TEMPLATE
         self._crop_start: Optional[int] = None
+
+    def enable_sequential_cpu_offload(
+        self,
+        gpu_id: Optional[int] = None,
+        device: Optional[Union[str, torch.device]] = None,
+    ) -> None:
+        super().enable_sequential_cpu_offload(gpu_id=gpu_id, device=device)
+
+        visual = getattr(getattr(self.text_encoder, "model", None), "visual", None)
+        if visual is None:
+            return
+
+        # Qwen reads a child embedding weight directly from its visual parent.
+        from accelerate import cpu_offload
+        from accelerate.hooks import remove_hook_from_module
+
+        remove_hook_from_module(self.text_encoder, recurse=True)
+        cpu_offload(
+            self.text_encoder,
+            execution_device=self._offload_device,
+            offload_buffers=bool(self.text_encoder._parameters),
+            preload_module_classes=[visual.__class__.__name__],
+        )
 
     @staticmethod
     def check_inputs(height: int, width: int, num_frames: int) -> None:
@@ -318,6 +341,27 @@ class LingBotVideoPipeline(DiffusionPipeline):
         std_inv = std_inv.view(1, -1, 1, 1, 1)
         return (latents.float() - mean) * std_inv
 
+    def _vae_execution_device(self) -> torch.device:
+        """Return the VAE hook device, falling back to its parameter device."""
+        for module in self.vae.modules():
+            hook = getattr(module, "_hf_hook", None)
+            execution_device = getattr(hook, "execution_device", None)
+            if execution_device is not None:
+                return torch.device(execution_device)
+        return _module_device(self.vae)
+
+    @contextmanager
+    def _vae_encode_context(self):
+        """Isolate an out-of-order VAE encode from the linear offload chain."""
+        model_offload = bool(getattr(self, "_all_hooks", None))
+        if model_offload:
+            self.maybe_free_model_hooks()
+        try:
+            yield self._vae_execution_device()
+        finally:
+            if model_offload:
+                self.maybe_free_model_hooks()
+
     @torch.no_grad()
     def encode_video_latent(
         self,
@@ -326,31 +370,33 @@ class LingBotVideoPipeline(DiffusionPipeline):
     ) -> torch.Tensor:
         if self.vae is None:
             raise ValueError("`vae` is required to encode video latents.")
-        vae_device = _module_device(self.vae)
-        video = video.to(device=vae_device, dtype=torch.float32)
-        bsz, channels, frames, height, width = video.shape
-        flat_video = video.permute(0, 2, 1, 3, 4).reshape(bsz * frames, channels, height, width)
-        norm_flat_video = normalize_image_tensor(
-            flat_video,
-            [0.5, 0.5, 0.5],
-            [0.5, 0.5, 0.5],
-            inplace=False,
-        )
-        norm_video = (
-            norm_flat_video.reshape(bsz, frames, channels, height, width)
-            .permute(0, 2, 1, 3, 4)
-            .contiguous()
-        )
-        with torch.autocast(
-            "cuda",
-            dtype=torch.bfloat16,
-            enabled=vae_device.type == "cuda",
-        ):
-            encoded = self.vae.encode(norm_video)
-        if hasattr(encoded, "latent_dist"):
-            latents = encoded.latent_dist.sample(generator)
-        else:
-            latents = encoded[0] if isinstance(encoded, tuple) else encoded
+        with self._vae_encode_context() as vae_device:
+            video = video.to(device=vae_device, dtype=torch.float32)
+            bsz, channels, frames, height, width = video.shape
+            flat_video = video.permute(0, 2, 1, 3, 4).reshape(
+                bsz * frames, channels, height, width
+            )
+            norm_flat_video = normalize_image_tensor(
+                flat_video,
+                [0.5, 0.5, 0.5],
+                [0.5, 0.5, 0.5],
+                inplace=False,
+            )
+            norm_video = (
+                norm_flat_video.reshape(bsz, frames, channels, height, width)
+                .permute(0, 2, 1, 3, 4)
+                .contiguous()
+            )
+            with torch.autocast(
+                "cuda",
+                dtype=torch.bfloat16,
+                enabled=vae_device.type == "cuda",
+            ):
+                encoded = self.vae.encode(norm_video)
+            if hasattr(encoded, "latent_dist"):
+                latents = encoded.latent_dist.sample(generator)
+            else:
+                latents = encoded[0] if isinstance(encoded, tuple) else encoded
         return self._vae_latent_to_dit(latents).to(latents)
 
     @torch.no_grad()
@@ -358,7 +404,7 @@ class LingBotVideoPipeline(DiffusionPipeline):
         self,
         latents: torch.Tensor,
     ) -> List[np.ndarray]:
-        vae_device = _module_device(self.vae)
+        vae_device = self._vae_execution_device()
         vae_dtype = _module_dtype(self.vae)
         vae_latents = self._dit_latent_to_vae(latents).to(device=vae_device, dtype=torch.float32)
         if vae_latents.ndim == 5:
