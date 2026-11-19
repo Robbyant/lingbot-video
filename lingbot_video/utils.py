@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -20,7 +21,13 @@ LOW_NOISE_TAIL_V1_DEFAULT_STEPS = 2
 
 
 def num_frames_from_duration(duration: float, fps: int) -> int:
-    frame_count = int(float(duration) * int(fps))
+    duration = float(duration)
+    fps = int(fps)
+    if not math.isfinite(duration) or duration <= 0:
+        raise ValueError("Video duration must be finite and positive.")
+    if fps <= 0:
+        raise ValueError("Video FPS must be positive.")
+    frame_count = int(duration * fps)
     return ((frame_count - 1) // 4 + 1) * 4 + 1
 
 

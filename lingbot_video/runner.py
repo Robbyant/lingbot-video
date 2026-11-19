@@ -1371,6 +1371,8 @@ def main() -> None:
         args.negative_prompt = (
             DEFAULT_NEGATIVE_PROMPT_IMAGE if args.mode == "t2i" else DEFAULT_NEGATIVE_PROMPT
         )
+    if args.mode != "t2i" and args.fps <= 0:
+        raise ValueError("--fps must be positive for video generation.")
     if args.mode != "t2i" and args.duration is not None:
         if num_frames_from_duration is None:
             raise RuntimeError("num_frames_from_duration is not importable.") from _LINGBOT_PIPELINE_IMPORT_ERROR
